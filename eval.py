@@ -11,36 +11,83 @@ from decord import VideoReader, cpu
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image
+from vbench import VBench
 
+##############################################################
+# Aranged in categories for better readability
+# Directory structure assumption:
+# ref_videos_dir
+# base_path/       # base path of a specific category
+#   prompts.json
+#   video1.mp4
+#   ...
+# gen_videos_dir
+# base_path/       # base path of a specific category
+#   videos/      # contains subdirs prompt1..prompt5
+#    prompt1/
+#      video1.mp4
+#      ...
+#    ...
+#   ...
+###############################################################
 
 class Video_Metrics_Processor:
     def __init__(
         self,
-        prompt_video_path,
-        ref_video_path,
-        prompt,
-        cotracker_path,
+        base_ref_path: str, # Path to the directory that contains the prompt file and videos,
+        base_gen_path: str, # Path to the directory that contains the generated videos
+        cotracker_ckpt: str, # Path to the CoTracker checkpoint, we use the scaled_offline.pth
         clip_model="openai/clip-vit-base-patch32",
         device="cuda",
     ):
-        self.prompt_video_path = prompt_video_path
-        self.prompt = prompt
-        self.ref_video_file = ref_video_path
+        self.base_ref_path = base_ref_path
+        self.base_gen_path = base_gen_path
         if not torch.cuda.is_available():
             device = "cpu"
             print("CUDA is not available, using CPU instead.")
         self.device = device
-        cotracker_model = CoTrackerPredictor(checkpoint=cotracker_path)
+        cotracker_model = CoTrackerPredictor(checkpoint=cotracker_ckpt)
         self.cotracker_model = cotracker_model.to(self.device)
         self.clip_model = CLIPModel.from_pretrained(clip_model).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(clip_model)
-
-    def compute_text_frame_sim(self, images):  # operate on a single video
+        
+        self.vbench = VBench(
+            device=device,
+            full_info_dir='VBench_full_info.json',  # Path to downloaded JSON
+            output_path='evaluation_results'    # Directory to save results
+        )
+        
+    def read_prompt_file(self):
+        '''
+        Read the prompt file from the reference video directory.
+        And return a dictionary mapping video names to their prompts.
+        '''
+        prompt_file = os.path.join(self.base_ref_path, "prompts.json")
+        if not os.path.exists(prompt_file):
+            raise FileNotFoundError(f"Prompt file {prompt_file} does not exist.")
+        with open(prompt_file, "r") as f:
+            prompts = json.load(f)
+        return prompts  # {video_name: [prompt1, prompt2..prompt5] ...}
+    
+    def read_ref_videos(self, prompts: dict):
+        '''
+        Utilize the video name to read the reference video, and return a dictionary
+        mapping video name to its ref video path.
+        '''
+        ref_video_paths = {}
+        for key in prompts.keys():
+            ref_video_path = os.path.join(self.base_ref_path, key + ".mp4")
+            if not os.path.exists(ref_video_path):
+                raise FileNotFoundError(f"Reference video {ref_video_path} does not exist.")
+            ref_video_paths[key] = ref_video_path
+        return ref_video_paths # {video_name: ref_video_path}
+    
+    def compute_text_frame_sim(self, images, prompt):  # operate on a single video
         with torch.no_grad():
 
             max_len = getattr(getattr(self.clip_model.config, "text_config", None), "max_position_embeddings", 77)
             text_inputs = self.processor(
-                text=[self.prompt],                # 显式列表更稳
+                text=[prompt],                # 显式列表更稳
                 return_tensors="pt",
                 padding=True,
                 truncation=True,                   # 开启截断
@@ -53,43 +100,42 @@ class Video_Metrics_Processor:
             image_feats = self.clip_model.get_image_features(**image_inputs)
             image_feats = image_feats / image_feats.norm(dim=-1, keepdim=True)  # (N, D)
 
-        sim_scores = (image_feats @ text_feats.T).squeeze(-1).detach().cpu().mean().item()
-        return sim_scores, image_feats  # image_feats: [N, D] on self.device
-
-    @staticmethod
-    def compute_temporal_consistency(img_feats):  # operate on a single video
+        text_frame_sim_score = (image_feats @ text_feats.T).squeeze(-1).detach().cpu().mean().item()
         sims = []
-        for i in range(len(img_feats) - 1):
-            a = img_feats[i]
-            b = img_feats[i + 1]
+        for i in range(len(image_feats) - 1):
+            a = image_feats[i]
+            b = image_feats[i + 1]
             sims.append((a @ b.T) / (a.norm() * b.norm()))
-        return torch.tensor(sims).detach().cpu().mean().item()  # a single number
+        temporal_sim_score = torch.tensor(sims).detach().cpu().mean().item()
+        return  text_frame_sim_score, temporal_sim_score 
 
-    @staticmethod
-    def get_similarity_matrix(tracklets1, tracklets2):
-        # tracklets*: [N, T, 2] and [M, T, 2]
-        eps = 1e-8
-        displacements1 = tracklets1[:, 1:] - tracklets1[:, :-1]  # [N, T-1, 2]
-        displacements1 = displacements1 / (displacements1.norm(dim=-1, keepdim=True) + eps)
+    def get_mf_score(self, ref_video_path, gen_video_path,):
+        
+        def get_tracklets(self, video_path, mask=None):
+            video = read_video_from_path(video_path)  # numpy: [T, H, W, 3], uint8
+            video = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float().to(self.device)  # [1, T, 3, H, W]
+            with torch.no_grad():
+                pred_tracks_small, pred_visibility_small = self.cotracker_model(
+                    video, grid_size=55, segm_mask=mask
+                )  # [B, T, L, 2]
+            pred_tracks_small = rearrange(pred_tracks_small, "b t l c -> (b l) t c")  # [N, T, 2]
+            return pred_tracks_small
+        
+        def get_similarity_matrix(tracklets1, tracklets2):
+            # tracklets*: [N, T, 2] and [M, T, 2]
+            eps = 1e-8
+            displacements1 = tracklets1[:, 1:] - tracklets1[:, :-1]  # [N, T-1, 2]
+            displacements1 = displacements1 / (displacements1.norm(dim=-1, keepdim=True) + eps)
 
-        displacements2 = tracklets2[:, 1:] - tracklets2[:, :-1]  # [M, T-1, 2]
-        displacements2 = displacements2 / (displacements2.norm(dim=-1, keepdim=True) + eps)
+            displacements2 = tracklets2[:, 1:] - tracklets2[:, :-1]  # [M, T-1, 2]
+            displacements2 = displacements2 / (displacements2.norm(dim=-1, keepdim=True) + eps)
 
-        similarity_matrix = torch.einsum("ntc,mtc->nmt", displacements1, displacements2).mean(dim=-1)  # [N, M]
-        return similarity_matrix
-
-    def get_tracklets(self, video_path, mask=None):
-        video = read_video_from_path(video_path)  # numpy: [T, H, W, 3], uint8
-        video = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float().to(self.device)  # [1, T, 3, H, W]
-        with torch.no_grad():
-            pred_tracks_small, pred_visibility_small = self.cotracker_model(
-                video, grid_size=55, segm_mask=mask
-            )  # [B, T, L, 2]
-        pred_tracks_small = rearrange(pred_tracks_small, "b t l c -> (b l) t c")  # [N, T, 2]
-        return pred_tracks_small
-
-    @staticmethod
-    def get_mf_score(similarity_matrix):
+            similarity_matrix = torch.einsum("ntc,mtc->nmt", displacements1, displacements2).mean(dim=-1)  # [N, M]
+            return similarity_matrix
+        
+        ref_tracklets = get_tracklets(self, ref_video_path)  # (num_tracks, num_frames, 2)
+        gen_tracklets = get_tracklets(self, gen_video_path)  # (num_tracks, num_frames, 2)
+        similarity_matrix = get_similarity_matrix(ref_tracklets, gen_tracklets)
         # similarity_matrix: [N, M]
         n, m = similarity_matrix.shape
         if n == m:
@@ -98,63 +144,96 @@ class Video_Metrics_Processor:
         max_similarity, _ = similarity_matrix.max(dim=1)  # per source track best match in ref
         average_score = max_similarity.mean()
         return average_score.item()
-
-    def process_all_videos(self):
-        files = os.listdir(self.prompt_video_path)
-        files = [f for f in files if f.endswith(".mp4")]
-        mf_scores = []
-        text_frame_sims = []
-        temporal_consists = []
-        results = []
-        for file in files:
-            video_path = os.path.join(self.prompt_video_path, file)
-            #ref_video_file = os.path.join(self.ref_video_path, file)
-            if not os.path.exists(self.ref_video_file):
-                print(f"[Warn] Reference video not found for {file}: {self.ref_video_file}, skip.")
-                continue
-
-            print(f"Processing {video_path} ...")
-            print(f"prompt: {self.prompt}")
-
-            # Motion fidelity via CoTracker
-            tracklets_gen = self.get_tracklets(video_path)  # (num_tracks, num_frames, 2)
-            tracklets_ref = self.get_tracklets(self.ref_video_file)  # (num_tracks, num_frames, 2)
-
-            similarity_matrix = self.get_similarity_matrix(tracklets_gen, tracklets_ref)
-            mf_score = self.get_mf_score(similarity_matrix)
-
-            # Text-frame similarity and temporal consistency via CLIP
-            vr = VideoReader(video_path, ctx=cpu(0))
-            frames = vr.get_batch(range(len(vr))).asnumpy()  # N, H, W, 3
-            images = list(frames)
-            text_frame_sim, img_feats = self.compute_text_frame_sim(images)
-            temporal_consist = self.compute_temporal_consistency(img_feats)
-
-            mf_scores.append(mf_score)
-            text_frame_sims.append(text_frame_sim)
-            temporal_consists.append(temporal_consist)
-            results.append(
-                {
-                    "video": file,
-                    "text_frame_similarity": text_frame_sim,
-                    "temporal_consistency": temporal_consist,
-                    "mf_score": mf_score,
-                }
-            )
-
-        avg_mf = sum(mf_scores) / len(mf_scores) if mf_scores else 0
-        avg_text_frame_sim = sum(text_frame_sims) / len(text_frame_sims) if text_frame_sims else 0
-        avg_temporal_consist = sum(temporal_consists) / len(temporal_consists) if temporal_consists else 0
-        results.append(
-            {
-                "video": "Average",
-                "text_frame_similarity": avg_text_frame_sim,
-                "temporal_consistency": avg_temporal_consist,
-                "mf_score": avg_mf,
-            }
+    
+    def get_vbench_score(self, gen_video_path, prompt):
+        dimensions = [
+            'subject_consistency',
+            'background_consistency',
+            'motion_smoothness',
+            'dynamic_degree',
+            'aesthetic_quality',
+            'imaging_quality'
+        ]
+        results = self.vbench.evaluate(
+            videos_path=gen_video_path, 
+            name='results', 
+            prompt_list=[prompt], 
+            dimension_list=dimensions,
+            mode='custom_input'
         )
         return results
-
+    
+    def process_all_videos(self):
+        prompts = self.read_prompt_file()  # {video_name: [prompt1, prompt2..prompt5]}
+        ref_video_paths = self.read_ref_videos(prompts) # {video_name: ref_video_path}
+        all_results = {}
+        global_scores = []
+        for video_name, ref_video_path in ref_video_paths.items():
+            video_results = {}
+            video_prompt_scores = []
+            for i, prompt in enumerate(prompts[video_name]):
+                gen_videos_dir = os.path.join(self.base_gen_path, video_name, f"prompt{i+1}")
+                videos = os.listdir(gen_videos_dir)
+                if len(videos) == 0:
+                    print(f"[Warn] No generated videos found in {gen_videos_dir}, skip.")
+                    continue
+                prompt_results = []
+                for video in videos:
+                    gen_video_path = os.path.join(gen_videos_dir, video)
+                    if not os.path.exists(gen_video_path):
+                        print(f"[Warn] Generated video not found for {video_name} prompt {i+1}: {gen_video_path}, skip.")
+                        continue
+                    print(f"Processing {gen_video_path} with reference {ref_video_path} and prompt: {prompt}")
+                    
+                    # Read generated video frames
+                    vr = VideoReader(gen_video_path, ctx=cpu(0))
+                    frames = vr.get_batch(range(len(vr)))
+                    images = list(frames)
+                    
+                    text_sim, temporal_sim = self.compute_text_frame_sim(images, prompt)
+                    mf_score = self.get_mf_score(ref_video_path, gen_video_path)
+                    vbench_scores = self.get_vbench_score(gen_video_path, prompt)
+                    vbench_scores['text_frame_similarity'] = text_sim
+                    vbench_scores['temporal_consistency'] = temporal_sim
+                    vbench_scores['motion_fidelity'] = mf_score
+                    vbench_scores['video_file'] = video
+                    prompt_results.append(vbench_scores)
+                    global_scores.append(vbench_scores)
+                # 计算该prompt下所有视频的平均
+                avg_scores = {}
+                if len(prompt_results) > 0:
+                    for key in prompt_results[0].keys():
+                        if key == 'video_file': continue
+                        avg_scores[key] = sum([res[key] for res in prompt_results]) / len(prompt_results)
+                    avg_scores['video_file'] = 'Average'
+                    prompt_results.append(avg_scores)
+                video_results[f'prompt{i+1}'] = prompt_results
+                video_prompt_scores.extend(prompt_results[:-1])  # 不包括平均行
+            # 计算该video所有prompt的平均
+            video_avg_scores = {}
+            if len(video_prompt_scores) > 0:
+                for key in video_prompt_scores[0].keys():
+                    if key == 'video_file': continue
+                    video_avg_scores[key] = sum([res[key] for res in video_prompt_scores]) / len(video_prompt_scores)
+                video_avg_scores['video_file'] = 'Video_Average'
+                video_results['video_average'] = video_avg_scores
+            all_results[video_name] = video_results
+        # 计算全局平均
+        if len(global_scores) > 0:
+            global_avg = {}
+            for key in global_scores[0].keys():
+                if key == 'video_file': continue
+                global_avg[key] = sum([res[key] for res in global_scores]) / len(global_scores)
+            global_avg['video_file'] = 'Global_Average'
+            all_results['global_average'] = global_avg
+        # 保存结果
+        os.makedirs('results', exist_ok=True)
+        with open('results/video_metrics_hierarchical.json', 'w') as f:
+            json.dump(all_results, f, indent=4, ensure_ascii=False)
+        print("Hierarchical results saved to results/video_metrics_hierarchical.json")
+        return all_results
+    
+##############################################################
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
